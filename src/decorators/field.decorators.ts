@@ -21,6 +21,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 
+import { ACCEPTED_UUID_VERSIONS } from '../common/uuid';
 import { type Constructor } from '../types';
 import { ApiEnumProperty, ApiUUIDProperty } from './property.decorators';
 import {
@@ -74,6 +75,8 @@ export function NumberField(
     INumberFieldOptions = {},
 ): PropertyDecorator {
   const decorators = [Type(() => Number)];
+  const minimum = options.min ?? options.minimum;
+  const maximum = options.max ?? options.maximum;
 
   if (options.nullable) {
     decorators.push(IsNullable({ each: options.each }));
@@ -82,7 +85,17 @@ export function NumberField(
   }
 
   if (options.swagger !== false) {
-    decorators.push(ApiProperty({ type: Number, ...options }));
+    const swaggerOptions = { ...options, maximum, minimum };
+
+    delete swaggerOptions.max;
+    delete swaggerOptions.min;
+
+    decorators.push(
+      ApiProperty({
+        type: Number,
+        ...swaggerOptions,
+      }),
+    );
   }
 
   if (options.each) {
@@ -95,12 +108,12 @@ export function NumberField(
     decorators.push(IsNumber({}, { each: options.each }));
   }
 
-  if (typeof options.min === 'number') {
-    decorators.push(Min(options.min, { each: options.each }));
+  if (typeof minimum === 'number') {
+    decorators.push(Min(minimum, { each: options.each }));
   }
 
-  if (typeof options.max === 'number') {
-    decorators.push(Max(options.max, { each: options.each }));
+  if (typeof maximum === 'number') {
+    decorators.push(Max(maximum, { each: options.each }));
   }
 
   if (options.isPositive) {
@@ -402,7 +415,10 @@ export function UUIDField(
   > &
     IFieldOptions = {},
 ): PropertyDecorator {
-  const decorators = [Type(() => String), IsUUID('4', { each: options.each })];
+  const decorators = [
+    Type(() => String),
+    IsUUID([...ACCEPTED_UUID_VERSIONS], { each: options.each }),
+  ];
 
   if (options.nullable) {
     decorators.push(IsNullable());

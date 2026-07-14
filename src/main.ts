@@ -6,37 +6,43 @@ import {
   VersioningType,
 } from '@nestjs/common';
 import { NestFactory, Reflector } from '@nestjs/core';
-import { Transport } from '@nestjs/microservices';
 import {
   ExpressAdapter,
   type NestExpressApplication,
 } from '@nestjs/platform-express';
 import compression from 'compression';
-import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import morgan from 'morgan';
-import { initializeTransactionalContext } from 'typeorm-transactional';
 
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './filters/bad-request.filter';
 import { QueryFailedFilter } from './filters/query-failed.filter';
 import { setupSwagger } from './setup-swagger';
 import { ApiConfigService } from './shared/services/api-config.service';
-import { SharedModule } from './shared/shared.module';
 
 const bootstrap = async () => {
-  initializeTransactionalContext();
   const app = await NestFactory.create<NestExpressApplication>(
     AppModule,
     new ExpressAdapter(),
-    { cors: true },
+    { cors: false },
   );
-  app.enable('trust proxy'); // only if you're behind a reverse proxy (Heroku, Bluemix, AWS ELB, Nginx, etc)
+  const configService = app.get(ApiConfigService);
+
+  if (configService.appConfig.corsOrigins.length > 0) {
+    app.enableCors({
+      origin: configService.appConfig.corsOrigins,
+      credentials: false,
+    });
+  }
+
+  if (configService.appConfig.trustProxyHops > 0) {
+    app.set('trust proxy', configService.appConfig.trustProxyHops);
+  }
+
   app.use(helmet());
   // app.setGlobalPrefix('/api'); use api as global prefix if you don't have subdomain
   app.use(compression());
   app.use(morgan('combined'));
-  app.use(cookieParser());
   app.enableVersioning({
     defaultVersion: '1',
     type: VersioningType.URI,
@@ -61,30 +67,11 @@ const bootstrap = async () => {
     }),
   );
 
-  const configService = app.select(SharedModule).get(ApiConfigService);
-
-  // only start nats if it is enabled
-  if (configService.natsEnabled) {
-    const natsConfig = configService.natsConfig;
-    app.connectMicroservice({
-      transport: Transport.NATS,
-      options: {
-        url: `nats://${natsConfig.host}:${natsConfig.port}`,
-        queue: 'main_service',
-      },
-    });
-
-    await app.startAllMicroservices();
-  }
-
   if (configService.documentationEnabled) {
     setupSwagger(app);
   }
 
-  // Starts listening for shutdown hooks
-  if (!configService.isDevelopment) {
-    app.enableShutdownHooks();
-  }
+  app.enableShutdownHooks();
 
   const port = configService.appConfig.port;
   await app.listen(port);
@@ -94,4 +81,7 @@ const bootstrap = async () => {
   return app;
 };
 
-void bootstrap();
+void bootstrap().catch((error: unknown) => {
+  console.error('Application bootstrap failed', error);
+  process.exitCode = 1;
+});

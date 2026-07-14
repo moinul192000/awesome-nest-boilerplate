@@ -1,4 +1,4 @@
-import { forwardRef, Module } from '@nestjs/common';
+import { Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 
@@ -8,31 +8,31 @@ import { UserModule } from '../user/user.module';
 import { AuthController } from './auth.controller';
 import { AuthService } from './auth.service';
 import { JwtStrategy } from './jwt.strategy';
-import { PublicStrategy } from './public.strategy';
-import { RefreshTokenStrategy } from './refresh-token.strategy';
 
 @Module({
   imports: [
-    forwardRef(() => UserModule),
-    forwardRef(() => IAMModule),
-    PassportModule.register({ defaultStrategy: 'jwt' }),
+    UserModule,
+    IAMModule,
+    PassportModule,
     JwtModule.registerAsync({
       useFactory: (configService: ApiConfigService) => ({
         privateKey: configService.authConfig.privateKey,
         publicKey: configService.authConfig.publicKey,
         signOptions: {
           algorithm: 'RS256',
-          //     expiresIn: configService.getNumber('JWT_EXPIRATION_TIME'),
+          issuer: configService.authConfig.issuer,
+          audience: configService.authConfig.audience,
         },
         verifyOptions: {
           algorithms: ['RS256'],
+          issuer: configService.authConfig.issuer,
+          audience: configService.authConfig.audience,
         },
       }),
       inject: [ApiConfigService],
     }),
   ],
   controllers: [AuthController],
-  providers: [AuthService, JwtStrategy, PublicStrategy, RefreshTokenStrategy],
-  exports: [JwtModule, AuthService],
+  providers: [AuthService, JwtStrategy],
 })
 export class AuthModule {}

@@ -1,34 +1,33 @@
 import {
   applyDecorators,
+  BadRequestException,
   Param,
-  ParseUUIDPipe,
   type PipeTransform,
-  UseGuards,
-  UseInterceptors,
 } from '@nestjs/common';
 import { type Type } from '@nestjs/common/interfaces';
 import { ApiBearerAuth, ApiUnauthorizedResponse } from '@nestjs/swagger';
 
+import { isAcceptedUuid } from '../common/uuid';
 import type { Permission } from '../constants/permissions.enum';
-import { AuthGuard } from '../guards/auth.guard';
-import { PermissionsGuard } from '../guards/permissions.guard';
-import { AuthUserInterceptor } from '../interceptors/auth-user-interceptor.service';
 import { Permissions } from './permissions.decorator';
-import { PublicRoute } from './public-route.decorator';
 
-export function Auth(
-  permissions: Permission[] = [],
-  options?: Partial<{ public: boolean }>,
-): MethodDecorator {
-  const isPublicRoute = options?.public;
+class ParseAcceptedUuidPipe implements PipeTransform<string, Uuid> {
+  transform(value: string): Uuid {
+    if (!isAcceptedUuid(value)) {
+      throw new BadRequestException(
+        'Validation failed (UUIDv4 or UUIDv7 is expected)',
+      );
+    }
 
+    return value;
+  }
+}
+
+export function Auth(permissions: Permission[] = []): MethodDecorator {
   return applyDecorators(
     Permissions(permissions),
-    UseGuards(AuthGuard({ public: isPublicRoute }), PermissionsGuard),
     ApiBearerAuth(),
-    UseInterceptors(AuthUserInterceptor),
     ApiUnauthorizedResponse({ description: 'Unauthorized' }),
-    PublicRoute(isPublicRoute),
   );
 }
 
@@ -36,5 +35,5 @@ export function UUIDParam(
   property: string,
   ...pipes: Array<Type<PipeTransform> | PipeTransform>
 ): ParameterDecorator {
-  return Param(property, new ParseUUIDPipe({ version: '4' }), ...pipes);
+  return Param(property, new ParseAcceptedUuidPipe(), ...pipes);
 }

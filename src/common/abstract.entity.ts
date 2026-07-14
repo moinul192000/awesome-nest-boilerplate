@@ -1,10 +1,7 @@
-import {
-  CreateDateColumn,
-  PrimaryGeneratedColumn,
-  UpdateDateColumn,
-} from 'typeorm';
+import { CreateDateColumn, PrimaryColumn, UpdateDateColumn } from 'typeorm';
 
 import { type AbstractDto } from './dto/abstract.dto';
+import { generateUuid } from './uuid';
 
 /**
  * Abstract Entity
@@ -18,8 +15,8 @@ export abstract class AbstractEntity<
   DTO extends AbstractDto = AbstractDto,
   O = never,
 > {
-  @PrimaryGeneratedColumn('uuid')
-  id!: Uuid;
+  @PrimaryColumn({ type: 'uuid' })
+  id: Uuid = generateUuid();
 
   @CreateDateColumn({
     type: 'timestamp',
@@ -32,7 +29,10 @@ export abstract class AbstractEntity<
   updatedAt!: Date;
 
   toDto(options?: O): DTO {
-    const dtoClass = Object.getPrototypeOf(this).dtoClass;
+    const prototype = Object.getPrototypeOf(this) as {
+      dtoClass?: new (entity: AbstractEntity<DTO, O>, options?: O) => DTO;
+    };
+    const { dtoClass } = prototype;
 
     if (!dtoClass) {
       throw new Error(

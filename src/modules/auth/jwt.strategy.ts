@@ -1,74 +1,113 @@
-import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  ServiceUnavailableException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { plainToInstance } from 'class-transformer';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 
-import { TokenType } from '../../constants';
 import { ApiConfigService } from '../../shared/services/api-config.service';
-import { type Uuid } from '../../types';
+import { type AuthenticatedUser } from '../../types/auth-user.type';
 import { CacheService } from '../cache/cache.service';
+import { AccountAccessStateService } from '../user/account-access-state.service';
 import { UserEntity } from '../user/user.entity';
 import { UserService } from '../user/user.service';
+import { type AccessTokenClaims, accessTokenClaimsSchema } from './jwt-claims';
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   private readonly logger = new Logger(JwtStrategy.name);
 
   constructor(
-    configService: ApiConfigService,
+    private readonly configService: ApiConfigService,
     private userService: UserService,
     private cacheService: CacheService,
+    private accountAccessStateService: AccountAccessStateService,
   ) {
     super({
-      jwtFromRequest: ExtractJwt.fromExtractors([
-        ExtractJwt.fromAuthHeaderAsBearerToken(),
-        (request) => {
-          if (request.cookies?.accessToken) {
-            return request.cookies.accessToken;
-          }
-
-          return null;
-        },
-      ]),
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       secretOrKey: configService.authConfig.publicKey,
+      algorithms: ['RS256'],
+      issuer: configService.authConfig.issuer,
+      audience: configService.authConfig.audience,
     });
   }
 
-  async validate(payload: {
-    userId: Uuid;
-    type: TokenType;
-  }): Promise<UserEntity> {
-    if (payload.type !== TokenType.ACCESS_TOKEN) {
-      throw new UnauthorizedException('Invalid token type');
+  async validate(payload: unknown): Promise<AuthenticatedUser> {
+    const claimsResult = accessTokenClaimsSchema.safeParse(payload);
+
+    if (!claimsResult.success) {
+      throw new UnauthorizedException('Invalid access token claims');
     }
 
-    const userCacheKey = this.cacheService.getUserKey(payload.userId);
+    const claims = claimsResult.data;
+
+    try {
+      if (
+        await this.cacheService.isSessionBlacklisted(claims.sub, claims.sid)
+      ) {
+        throw new UnauthorizedException('Access token has been revoked');
+      }
+    } catch (error: unknown) {
+      if (error instanceof UnauthorizedException) {
+        throw error;
+      }
+
+      this.logger.error(
+        `Unable to verify token revocation for user ${claims.sub}: ${formatError(error)}`,
+      );
+      throw new ServiceUnavailableException(
+        'Token revocation service unavailable',
+      );
+    }
+
+    const accountState = await this.accountAccessStateService.requireActive(
+      claims.sub,
+      claims.sv,
+    );
+    const userCacheKey = this.cacheService.getUserKey(
+      claims.sub,
+      String(accountState.authorizationRevision),
+    );
 
     try {
       const cachedJsonUser = await this.cacheService.get(userCacheKey);
 
       if (cachedJsonUser) {
         try {
-          const plainUser = JSON.parse(cachedJsonUser);
+          const plainUser: unknown = JSON.parse(cachedJsonUser);
 
-          return plainToInstance(UserEntity, plainUser);
-        } catch (e) {
+          return this.createPrincipal(
+            plainToInstance(UserEntity, plainUser),
+            claims,
+          );
+        } catch (error: unknown) {
           this.logger.error(
-            `Error deserializing cached user ${payload.userId}: ${e}. Proceeding to DB lookup.`,
+            `Error deserializing cached user ${claims.sub}: ${formatError(error)}. Proceeding to DB lookup.`,
           );
         }
       }
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.error(
-        `Error fetching user ${payload.userId} from cache: ${error}. Proceeding to DB lookup.`,
+        `Error fetching user ${claims.sub} from cache: ${formatError(error)}. Proceeding to DB lookup.`,
       );
     }
 
     const user = await this.userService.findOne({
-      where: { id: payload.userId },
-      relations: ['roles', 'roles.permissions', 'directPermissions'],
+      where: { id: claims.sub },
+      relations: {
+        roles: { permissions: true },
+        directPermissions: true,
+      },
       select: {
         id: true,
+        status: true,
         email: true,
         firstName: true,
         lastName: true,
@@ -92,13 +131,29 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     }
 
     try {
-      await this.cacheService.insert(userCacheKey, JSON.stringify(user), 300);
-    } catch (cacheError) {
+      await this.cacheService.insert(
+        userCacheKey,
+        JSON.stringify(user),
+        this.configService.cacheConfig.userPermissionsTtl,
+      );
+    } catch (error: unknown) {
       this.logger.error(
-        `Failed to cache user ${payload.userId}: ${cacheError}`,
+        `Failed to cache user ${claims.sub}: ${formatError(error)}`,
       );
     }
 
-    return user;
+    return this.createPrincipal(user, claims);
+  }
+
+  private createPrincipal(
+    user: UserEntity,
+    claims: AccessTokenClaims,
+  ): AuthenticatedUser {
+    return Object.assign(user, {
+      authentication: {
+        accessTokenId: claims.jti,
+        sessionId: claims.sid,
+      },
+    }) as AuthenticatedUser;
   }
 }

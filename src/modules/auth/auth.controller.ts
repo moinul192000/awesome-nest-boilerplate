@@ -5,27 +5,32 @@ import {
   HttpCode,
   HttpStatus,
   Post,
-  Req,
-  Res,
   UploadedFile,
-  UseGuards,
   Version,
 } from '@nestjs/common';
-import { ApiOkResponse, ApiTags } from '@nestjs/swagger';
-import { Request, Response } from 'express';
+import {
+  ApiNoContentResponse,
+  ApiOkResponse,
+  ApiTags,
+  ApiUnauthorizedResponse,
+} from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
+import { ClsService } from 'nestjs-cls';
 
-import { ApiFile, Auth, AuthUser, Cookies } from '../../decorators';
+import { ApiFile, Auth, AuthUser, Public } from '../../decorators';
 import { type IFile } from '../../interfaces';
-import { ApiConfigService } from '../../shared/services/api-config.service';
 import { type AuthenticatedUser } from '../../types/auth-user.type';
 import { UserDto } from '../user/dtos/user.dto';
 import { UserService } from '../user/user.service';
 import { AuthService } from './auth.service';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { LoginPayloadDto } from './dto/login-payload.dto';
+import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { TokenPayloadDto } from './dto/token-payload.dto';
 import { UserLoginDto } from './dto/user-login.dto';
 import { UserRegisterDto } from './dto/user-register.dto';
-import { RefreshJwtGuard } from './refresh-jwt.guard';
+
+const AUTH_RATE_LIMIT_TTL = 60_000;
 
 @Controller('auth')
 @ApiTags('auth')
@@ -33,10 +38,12 @@ export class AuthController {
   constructor(
     private userService: UserService,
     private authService: AuthService,
-    private configService: ApiConfigService,
+    private readonly cls: ClsService,
   ) {}
 
   @Post('login')
+  @Public()
+  @Throttle({ default: { limit: 5, ttl: AUTH_RATE_LIMIT_TTL } })
   @HttpCode(HttpStatus.OK)
   @ApiOkResponse({
     type: LoginPayloadDto,
@@ -44,70 +51,30 @@ export class AuthController {
   })
   async userLogin(
     @Body() userLoginDto: UserLoginDto,
-    @Res({ passthrough: true }) response: Response,
   ): Promise<LoginPayloadDto> {
     const userEntity = await this.authService.validateUser(userLoginDto);
 
     const tokens = await this.authService.createTokens({
       userId: userEntity.id,
       roles: userEntity.roles,
+      sessionVersion: userEntity.sessionVersion,
     });
 
-    // Set refresh token as secure HTTP-only cookie
-    response.cookie('refreshToken', tokens.refreshToken, {
-      httpOnly: true,
-      secure: this.configService.isProduction,
-      sameSite: 'strict',
-      maxAge: this.configService.authConfig.cookieMaxAge,
-    });
-
-    response.cookie('accessToken', tokens.accessToken, {
-      httpOnly: true,
-      secure: this.configService.isProduction,
-      sameSite: 'strict',
-      maxAge: this.configService.authConfig.jwtExpirationTime * 1000,
-    });
-
-    return new LoginPayloadDto(userEntity.toDto(), {
-      expiresIn: tokens.expiresIn,
-      accessToken: tokens.accessToken,
-      refreshToken: tokens.refreshToken,
-    });
+    return new LoginPayloadDto(userEntity.toDto(), tokens);
   }
 
   @Post('refresh')
+  @Public()
+  @Throttle({ default: { limit: 10, ttl: AUTH_RATE_LIMIT_TTL } })
   @HttpCode(HttpStatus.OK)
-  @UseGuards(RefreshJwtGuard)
   @ApiOkResponse({
     type: TokenPayloadDto,
     description: 'New access and refresh tokens',
   })
-  async refreshToken(
-    @Req() request: Request,
-    @Res({ passthrough: true }) response: Response,
+  refreshToken(
+    @Body() refreshTokenDto: RefreshTokenDto,
   ): Promise<TokenPayloadDto> {
-    const refreshToken =
-      request.cookies.refreshToken || request.body?.refreshToken;
-
-    const tokens = await this.authService.refreshAccessToken(refreshToken);
-
-    // Set new refresh token as secure HTTP-only cookie
-    response.cookie('refreshToken', tokens.refreshToken, {
-      httpOnly: true,
-      secure: this.configService.isProduction,
-      sameSite: 'strict',
-      maxAge: this.configService.authConfig.cookieMaxAge,
-    });
-
-    // Set new access token as cookie as well
-    response.cookie('accessToken', tokens.accessToken, {
-      httpOnly: true,
-      secure: this.configService.isProduction,
-      sameSite: 'strict',
-      maxAge: this.configService.authConfig.jwtExpirationTime * 1000,
-    });
-
-    return tokens;
+    return this.authService.refreshAccessToken(refreshTokenDto.refreshToken);
   }
 
   @Post('logout')
@@ -118,35 +85,59 @@ export class AuthController {
   })
   async logout(
     @AuthUser() user: AuthenticatedUser,
-    @Cookies('refreshToken') refreshToken: string,
-    @Res({ passthrough: true }) response: Response,
+    @Body() refreshTokenDto: RefreshTokenDto,
   ): Promise<{
     message: string;
   }> {
-    if (refreshToken) {
-      await this.authService.logout(user.id, refreshToken);
-    }
-
-    // Clear refresh token cookie
-    response.clearCookie('refreshToken', {
-      httpOnly: true,
-      secure: this.configService.isProduction,
-      sameSite: 'strict',
-    });
-
-    // Clear access token cookie
-    response.clearCookie('accessToken', {
-      httpOnly: true,
-      secure: this.configService.isProduction,
-      sameSite: 'strict',
-    });
+    await this.authService.logout(
+      user.id,
+      user.authentication.sessionId,
+      refreshTokenDto.refreshToken,
+    );
 
     return {
       message: 'Successfully logged out',
     };
   }
 
+  @Post('logout-all')
+  @HttpCode(HttpStatus.OK)
+  @Auth()
+  @ApiOkResponse({
+    description: 'Successfully logged out from all sessions',
+  })
+  async logoutAll(@AuthUser() user: AuthenticatedUser): Promise<{
+    message: string;
+  }> {
+    await this.authService.logoutAll(user.id, this.cls.getId() as Uuid);
+
+    return {
+      message: 'Successfully logged out from all sessions',
+    };
+  }
+
+  @Post('change-password')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @Auth()
+  @ApiNoContentResponse({
+    description: 'Password changed and sessions revoked',
+  })
+  @ApiUnauthorizedResponse({ description: 'Current password is invalid' })
+  changePassword(
+    @AuthUser() user: AuthenticatedUser,
+    @Body() dto: ChangePasswordDto,
+  ): Promise<void> {
+    return this.authService.changePassword(
+      user.id,
+      dto.currentPassword,
+      dto.newPassword,
+      this.cls.getId() as Uuid,
+    );
+  }
+
   @Post('register')
+  @Public()
+  @Throttle({ default: { limit: 3, ttl: AUTH_RATE_LIMIT_TTL } })
   @HttpCode(HttpStatus.OK)
   @ApiOkResponse({ type: UserDto, description: 'Successfully Registered' })
   @ApiFile({ name: 'avatar' })
